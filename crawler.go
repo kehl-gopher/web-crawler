@@ -5,32 +5,36 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/temoto/robotstxt"
+	"golang.org/x/net/html"
 )
 
 type Queue struct {
+	queueLock *sync.RWMutex
 	Url       []string
 	Size      int64
-	queueLock *sync.RWMutex
 }
 
 type Crawler struct {
-	TotalCrawlSize int
-	LastCrawled    time.Time
+	TotalCrawlSize     int
+	LastCrawled        time.Time
+	TotalNumberOfQueue int
 }
 
 type CrawlContent struct {
 	Url       string
 	Topic     string
-	Body      string
+	Body      []byte
 	CrawledAt time.Time
 }
 
@@ -54,9 +58,9 @@ func markVisitedUrl(url string) bool {
 	return false
 }
 
-func (q *Queue) enqueue(value string) {
+func (q *Queue) enqueue(url string) {
 	q.queueLock.Lock()
-	q.Url = append(q.Url, value)
+	q.Url = append(q.Url, url)
 	q.queueLock.Unlock()
 	atomic.AddInt64(&q.Size, 1)
 }
@@ -74,8 +78,16 @@ func (q *Queue) dequeue() string {
 	return popped
 }
 
+func (q *Queue) isEmpty() bool {
+	q.queueLock.RLocker()
+	defer q.queueLock.Unlock()
+	return q.Size == 0
+}
+
 func main() {
 	var url, dbCred string
+	var wg, crawlGroup sync.WaitGroup
+
 	if err := godotenv.Load(); err != nil {
 		fmt.Fprintln(os.Stdout, "err: "+err.Error())
 		fmt.Fprintln(os.Stdout, "continuing...")
@@ -91,18 +103,97 @@ func main() {
 		fmt.Fprintln(os.Stdout, "no db cred provided, continuing...")
 	}
 
-	// queryResp := make(chan []byte, 50)
-	// urlChan := make(chan string, 10)
-	// queue := NewQueue()
+	queue := NewQueue()
+	body := make(chan []byte, 10)
+	queue.enqueue(url) // starter url
+	for i := 1; i <= 5; i++ {
+		crawlGroup.Add(1)
+		go crawlWebPage(queue, body, &crawlGroup)
+	}
 
-	// workers.... are crawlers.... and extractors both publish to queue>
-	// consumers.... crawlers and extractors both consume.... from message in the queue
-	//
-	// both crawlers and extrators will read and write to the queue
-	// using bfs search we search for urls current present in a page... and add to queue
+	crawlGroup.Wait()
+	for i := 1; i <= 5; i++ {
+		wg.Add(1)
+		go extractTextDataFromHTML(body, &wg)
+	}
+	go func() {
+		close(body)
+	}()
 
-	// 5 crawlers and 5
+	wg.Wait()
 	fmt.Printf("Finished crawling data... from provided seed url: %s\n", url)
+}
+
+func crawlWebPage(queue *Queue, body chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for queue.Size > 0 {
+		poppedUrl := queue.dequeue()
+		purl, err := checkRobotstxt(poppedUrl)
+
+		if err != nil {
+			fmt.Printf("skipping -> %s: due to robots.txt guideline ->  %s", purl, err.Error())
+			continue
+		}
+
+		if markVisitedUrl(purl) {
+			fmt.Printf("skipping -> %s already visited", purl)
+			continue
+		}
+		resp, err := sendreq(purl)
+		if err != nil {
+			fmt.Printf("%s: added url back to queue error: %s", purl, err.Error())
+			queue.enqueue(purl)
+			continue
+		}
+		if resp.StatusCode == 200 {
+			bod, err := io.ReadAll(resp.Body)
+			if err != nil {
+				fmt.Printf("%s: added url back to queue error: %s", purl, err.Error())
+				continue
+			}
+			fmt.Println("send data to extractTextfromHTML goroutine")
+			body <- bod
+		}
+	}
+}
+
+func extractTextDataFromHTML(queueChan chan []byte, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for bytes := range queueChan {
+		reader := strings.NewReader(string(bytes))
+		tokenizer := html.NewTokenizer(reader)
+
+		for {
+			tt := tokenizer.Next()
+			if tt == html.ErrorToken {
+				tokenErr := tokenizer.Err()
+				if tokenErr == io.EOF {
+					fmt.Printf("EOF: %s\n", tokenErr.Error())
+					break
+				}
+				fmt.Printf("error tokenizing HTML: %v\n", tokenErr)
+				break
+			}
+
+			if tt == html.StartTagToken || tt == html.EndTagToken {
+				token := tokenizer.Token()
+
+				switch token.Data {
+				case "a":
+					var href string
+					for _, attr := range token.Attr {
+						if attr.Key == "href" {
+							href = strings.TrimSpace(attr.Val)
+							if !strings.HasPrefix(href, "https") {
+								continue
+							}
+							fmt.Printf("links: %s\n", href)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func checkRobotstxt(uri string) (string, error) {
