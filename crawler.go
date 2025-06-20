@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -16,6 +17,11 @@ import (
 
 	"github.com/joho/godotenv"
 	"github.com/temoto/robotstxt"
+	"go.mongodb.org/mongo-driver/v2/bson"
+	"go.mongodb.org/mongo-driver/v2/mongo"
+	"go.mongodb.org/mongo-driver/v2/mongo/options"
+	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
+
 	"golang.org/x/net/html"
 )
 
@@ -39,6 +45,13 @@ type CrawlContent struct {
 	Body      string    `bson:"body"`
 	CrawledAt time.Time `bson:"crawled_at"`
 }
+
+var (
+	DBconnected    bool
+	DBName         string = "crawledContent"
+	CollectionName string = "content"
+	mongoClient    *mongo.Collection
+)
 
 func NewQueue() *Queue {
 	url := make([]string, 0)
@@ -98,6 +111,65 @@ func (q *Queue) totalQueueSize() int64 {
 	return q.number
 }
 
+func ConnectDB(connStr string) *mongo.Collection {
+	client, err := mongo.Connect(options.Client().ApplyURI(connStr))
+	if err != nil {
+		DBconnected = false
+		fmt.Println("could not connect to mongdb: " + err.Error())
+		return nil
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err = client.Ping(ctx, readpref.Primary())
+	if err != nil {
+		DBconnected = false
+		fmt.Println("could not ping: " + err.Error())
+		return nil
+	}
+
+	collection := client.Database(DBName).Collection(CollectionName)
+
+	textModelIndex := mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "title", Value: "text"},
+			{Key: "body", Value: "text"},
+			{Key: "url", Value: "text"},
+		},
+	}
+
+	_, err = collection.Indexes().CreateOne(ctx, textModelIndex)
+	if err != nil {
+		fmt.Println("unable to create text index on collection: " + err.Error())
+	}
+
+	uniqueModelindex := mongo.IndexModel{
+		Keys: bson.D{
+			{Key: "url", Value: 1},
+		},
+		Options: options.Index().SetUnique(true),
+	}
+	_, err = collection.Indexes().CreateOne(ctx, uniqueModelindex)
+	if err != nil {
+		fmt.Println("unable to create unique index on collection: " + err.Error())
+	}
+
+	DBconnected = true
+	fmt.Println("database connected successfully")
+	return collection
+}
+
+func AddToCollections(ctx context.Context, col *mongo.Collection, docs []CrawlContent) error {
+	_, err := col.InsertMany(ctx, docs)
+	if err != nil {
+		fmt.Println("failed to insert data in mongo: " + err.Error())
+		return err
+	}
+
+	return nil
+}
+
 func main() {
 	var url, dbCred string
 	var wg sync.WaitGroup
@@ -110,11 +182,14 @@ func main() {
 	url, dbCred = os.Getenv("CRAWLURL"), os.Getenv("DBCred")
 
 	if url == "" {
-		fmt.Fprintln(os.Stderr, "no url provided")
+		fmt.Println("no url provided")
 		os.Exit(1)
 	}
-	if dbCred == "" {
-		fmt.Fprintln(os.Stdout, "no db cred provided, continuing...")
+
+	if dbCred != "" {
+		mongoClient = ConnectDB(dbCred)
+	} else {
+		fmt.Println("no db cred provided, continuing...")
 	}
 
 	queue := NewQueue()
@@ -135,8 +210,6 @@ func main() {
 					fmt.Println("channel close stopping enqueue go routine")
 					return
 				}
-
-				fmt.Println(queue.number)
 				if contain(url) {
 					fmt.Println("skipping url already visited previously no need to addd to queue")
 					continue
@@ -179,7 +252,7 @@ func crawlWebPage(queue *Queue, body chan []byte, wg *sync.WaitGroup) {
 
 		poppedUrl := queue.dequeue()
 		purl, err := checkRobotstxt(poppedUrl)
-		
+
 		if err != nil || purl == "" {
 			fmt.Printf("skipping -> %s: due to robots.txt guideline ->  %s\n", purl, err.Error())
 			continue
@@ -234,6 +307,11 @@ func extractTextDataFromHTML(queueChan chan []byte, wg *sync.WaitGroup, urlChan 
 				token := tokenizer.Token()
 
 				switch token.Data {
+				case "title":
+					fmt.Println("body")
+				case "body":
+					fmt.Println("body")
+
 				case "a":
 					var href string
 					for _, attr := range token.Attr {
