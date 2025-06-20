@@ -86,7 +86,7 @@ func (q *Queue) isEmpty() bool {
 
 func main() {
 	var url, dbCred string
-	var wg, crawlGroup sync.WaitGroup
+	var wg sync.WaitGroup
 
 	if err := godotenv.Load(); err != nil {
 		fmt.Fprintln(os.Stdout, "err: "+err.Error())
@@ -105,20 +105,13 @@ func main() {
 
 	queue := NewQueue()
 	body := make(chan []byte, 10)
+	// done := make(chan bool)
 	queue.enqueue(url) // starter url
-	for i := 1; i <= 5; i++ {
-		crawlGroup.Add(1)
-		go crawlWebPage(queue, body, &crawlGroup)
-	}
 
-	crawlGroup.Wait()
-	for i := 1; i <= 5; i++ {
-		wg.Add(1)
-		go extractTextDataFromHTML(body, &wg)
-	}
-	go func() {
-		close(body)
-	}()
+	wg.Add(2)
+	go crawlWebPage(queue, body, &wg)
+
+	go extractTextDataFromHTML(body, &wg)
 
 	wg.Wait()
 	fmt.Printf("Finished crawling data... from provided seed url: %s\n", url)
@@ -155,6 +148,9 @@ func crawlWebPage(queue *Queue, body chan []byte, wg *sync.WaitGroup) {
 			body <- bod
 		}
 	}
+	go func() {
+		close(body)
+	}()
 }
 
 func extractTextDataFromHTML(queueChan chan []byte, wg *sync.WaitGroup) {
