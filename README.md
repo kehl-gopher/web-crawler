@@ -4,6 +4,14 @@ This is a simple web crawler I built using **Go**, an HTML tokenizer, and **Mong
 
 ---
 
+### 🧭 Why I Chose BFS
+
+I chose **Breadth-First Search (BFS)** over **Depth-First Search (DFS)** for crawling because it better simulates how users typically explore websites:
+
+- **Layer-by-layer crawling:** BFS visits pages in order of discovery, ensuring I prioritize top-level pages before going deeper. This is useful when the goal is to quickly discover the most important or accessible pages.
+- **Controlled growth:** By expanding outward evenly from the seed page, BFS helps avoid deep traversal into a single branch of a site, which could happen with DFS (and cause the crawler to miss broader content).
+
+
 ## 📌 What It Does
 
 * Starts crawling from a seed URL.
