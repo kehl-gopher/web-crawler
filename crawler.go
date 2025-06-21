@@ -28,16 +28,21 @@ import (
 type Queue[T CrawlContent | CrawledURL | Crawler] struct {
 	queueLock *sync.RWMutex
 	Url       []T
-	number    int64
-	size      int64
+	number    int32
+	totalSize int32
 }
 
 type Crawler struct {
-	PageCount          int
-	TotalCrawlSize     int
-	LastCrawledTime    time.Time
-	TotalCrawledTime   time.Time
-	SkippedPagesRobots int
+	startTime          time.Time
+	PageCount          int32
+	TotalCrawlSize     int32
+	SkippedPagesRobots int32
+	size               int32
+}
+
+type crawlerPerPage struct {
+	pagePerMinute      string
+	ratioPagePerMinute string
 }
 
 type CrawlContent struct {
@@ -61,7 +66,7 @@ var (
 	CollectionMetaData string = "url_metadata"
 	CrawlContentTopic  string = "add_content"
 	MetadataTopic      string = "add_metadata"
-	SeedUrl            string = "https://medium.com"
+	SeedUrl            string = "https://nexford.edu/"
 )
 
 func NewQueue[T Crawler | CrawlContent | CrawledURL]() *Queue[T] {
@@ -74,8 +79,9 @@ func NewQueue[T Crawler | CrawlContent | CrawledURL]() *Queue[T] {
 
 var urlVisited = sync.Map{}
 
-func visted(url string) {
+func (cs *Crawler) markvisted(url string) {
 	urlVisited.Store(hashurl(strings.TrimSuffix(url, "/")), true)
+	atomic.AddInt32(&cs.size, 1)
 }
 
 func hashurl(url string) string {
@@ -85,7 +91,7 @@ func hashurl(url string) string {
 	return hex.EncodeToString(hashed)
 }
 
-func contain(url string) bool {
+func visited(url string) bool {
 	if _, ok := urlVisited.Load(hashurl(strings.TrimSuffix(url, "/"))); ok {
 		return true
 	}
@@ -96,34 +102,33 @@ func (q *Queue[T]) enqueue(url T) {
 	q.queueLock.Lock()
 	q.Url = append(q.Url, url)
 	q.queueLock.Unlock()
-	atomic.AddInt64(&q.size, 1)
-	atomic.AddInt64(&q.number, 1)
+	atomic.AddInt32(&q.totalSize, 1)
+	atomic.AddInt32(&q.number, 1)
 }
 
-func (q *Queue[T]) dequeue() *T {
+func (q *Queue[T]) dequeue() T {
 	var zero T
 	q.queueLock.Lock()
 	if len(q.Url) == 0 {
 		q.queueLock.Unlock()
-		return &zero
+		return zero
 	}
 	popped := q.Url[0]
 	q.Url = q.Url[1:]
 	q.queueLock.Unlock()
-	atomic.AddInt64(&q.number, -1)
-	return &popped
+	atomic.AddInt32(&q.number, -1)
+	return popped
 }
 
 func (q *Queue[T]) isEmpty() bool {
-	q.queueLock.Lock()
-	defer q.queueLock.Unlock()
-	return q.number == 0
+	return atomic.LoadInt32(&q.number) == 0
 }
 
-func (q *Queue[T]) Size() int64 {
-	q.queueLock.Lock()
-	defer q.queueLock.Unlock()
-	return q.size
+func (q *Queue[T]) Size() int32 {
+	return atomic.LoadInt32(&q.number)
+}
+func (c *Crawler) Size() int32 {
+	return atomic.LoadInt32(&c.size)
 }
 
 func ConnectDB(connStr string) *mongo.Client {
@@ -196,13 +201,13 @@ func AddToCollections[T CrawledURL | CrawlContent](ctx context.Context, client *
 		fmt.Println("failed to insert data in mongo: " + err.Error())
 		return err
 	}
-	fmt.Println("data inserted successfully")
 	return nil
 }
 
 func main() {
 	var dbCred string
 	var mongoClient *mongo.Client
+	var wg sync.WaitGroup
 
 	if err := godotenv.Load(); err != nil {
 		fmt.Println("err: "+err.Error(), "continuing...")
@@ -216,47 +221,52 @@ func main() {
 		fmt.Println("no db cred provided, continuing...")
 	}
 
+	urlC := CrawledURL{Url: SeedUrl, Domain: ""}
+	crawlerQueue := NewQueue[CrawledURL]()
+	body := make(chan CrawledURL, 10)
+
+	crawlerQueue.enqueue(urlC)
+	cs := &Crawler{startTime: time.Now()}
+
 	//  work jhor... no go whyne me o...
 	ps := newPubsub[any]()
 
 	content := ps.subscribe(CrawlContentTopic, 100)
 
-	ps.wg.Add(3)
+	// tick := time.NewTicker(1 * time.Second)
+
+	// go func() {
+	// 	for t := range tick.C {
+	// 		crawlerStats(t, cs, crawlerQueue)
+	// 	}
+	// }()
+
+	wg.Add(3)
 	go func(content <-chan any) {
-		defer ps.wg.Done()
+		defer wg.Done()
 		for con := range content {
 			con, ok := con.(CrawlContent)
-			fmt.Println(ok)
 			if ok && mongoClient != nil {
-				fmt.Println("insert to db")
 				newContent[CrawlContent](mongoClient, CollectionContent, con)
 			}
 		}
 	}(content)
 
-	urlC := CrawledURL{Url: SeedUrl, Domain: ""}
-	crawlerQueue := NewQueue[CrawledURL]()
-	body := make(chan *CrawledURL, 10)
-
-	crawlerQueue.enqueue(urlC)
-
-	crawlerStat := &Crawler{PageCount: 0, TotalCrawlSize: 0, SkippedPagesRobots: 0}
-
 	go func() {
-		defer ps.wg.Done()
-		crawlWebPage(crawlerQueue, body)
+		defer wg.Done()
+		crawlWebPage(crawlerQueue, body, cs)
 	}()
 
 	go func() {
-		defer ps.wg.Done()
-		extractTextDataFromHTML(body, crawlerQueue, crawlerStat, ps)
-
+		defer wg.Done()
+		extractTextDataFromHTML(body, crawlerQueue, ps, cs)
+		ps.Shutdown()
 	}()
 
-	ps.wg.Wait()
-
-	ps.Shutdown()
-	fmt.Printf("Finished crawling data... from provided seed url: %s\n", SeedUrl)
+	wg.Wait()
+	// tick.Stop()
+	fmt.Printf("-------------------------------> finished crawling data... from provided seed url: %s <--------------------------------- \n", SeedUrl)
+	cs.printCrawler(time.Now(), int(cs.Size()))
 }
 
 func newContent[T CrawlContent | CrawledURL](client *mongo.Client, colName string, content T) {
@@ -267,14 +277,12 @@ func newContent[T CrawlContent | CrawledURL](client *mongo.Client, colName strin
 			err := AddToCollections[T](ctx, client, colName, content)
 			if err != nil {
 				fmt.Println("inserting data error: " + err.Error())
-			} else {
-				fmt.Println("inserting data complete: ")
 			}
 		}
 	}
 }
 
-func crawlWebPage(queue *Queue[CrawledURL], body chan *CrawledURL) {
+func crawlWebPage(queue *Queue[CrawledURL], body chan CrawledURL, crawledStat *Crawler) {
 
 	idle := 0
 	for {
@@ -286,6 +294,7 @@ func crawlWebPage(queue *Queue[CrawledURL], body chan *CrawledURL) {
 				close(body)
 				break
 			}
+
 			continue
 		}
 		idle = 0
@@ -293,63 +302,67 @@ func crawlWebPage(queue *Queue[CrawledURL], body chan *CrawledURL) {
 		purl, err := checkRobotstxt(poppedUrl.Url)
 
 		if err != nil || purl == "" {
-			fmt.Printf("skipping -> %s: due to robots.txt guideline ->  %s\n", purl, err.Error())
+			if purl == "" {
+				atomic.AddInt32(&crawledStat.SkippedPagesRobots, 1)
+			}
 			continue
 		}
 
-		if contain(purl) {
-			fmt.Printf("queue can no longer queue anymore %d\n", queue.Size())
+		if visited(purl) {
 			continue
 		}
 		resp, err := sendreq(purl)
-		visted(purl)
 		if err != nil {
 			fmt.Printf("%s: added url back to queue error: %s\n", purl, err.Error())
-			queue.enqueue(*poppedUrl)
+			queue.enqueue(poppedUrl)
 			continue
 		}
+		crawledStat.markvisted(purl)
 		if resp.StatusCode == 200 {
 			bod, err := io.ReadAll(resp.Body)
 			if err != nil {
 				fmt.Printf("%s: added url back to queue error: %s\n", purl, err.Error())
 				continue
 			}
-			poppedUrl.HTMLRaw = bod
-			// fmt.Println(string(bod))V
+			poppedUrl = CrawledURL{Url: purl, HTMLRaw: bod}
 			body <- poppedUrl
+
+			resp.Body.Close()
 		}
 	}
 
 }
 
-func extractTextDataFromHTML(queueChan chan *CrawledURL, queue *Queue[CrawledURL], crawler *Crawler, ps *PubSub[any]) {
+func extractTextDataFromHTML(queueChan chan CrawledURL, queue *Queue[CrawledURL], ps *PubSub[any], crawlerStat *Crawler) {
 	var skipTags = map[string]bool{
-		"script":   true,
-		"style":    true,
-		"noscript": true,
-		"template": true,
-		"iframe":   true,
-		"canvas":   true,
-		"svg":      true,
-		"meta":     true,
-		"link":     true,
-		"head":     true,
-		"object":   true,
-		"embed":    true,
-		"nav":      true,
-		"footer":   true,
-		"form":     true,
-		"img":      true,
+		"script":     true,
+		"style":      true,
+		"noscript":   true,
+		"template":   true,
+		"iframe":     true,
+		"canvas":     true,
+		"svg":        true,
+		"meta":       true,
+		"link":       true,
+		"head":       true,
+		"object":     true,
+		"embed":      true,
+		"javascript": true,
+		"nav":        true,
+		"footer":     true,
+		"form":       true,
+		"span":       true,
+		"img":        true,
 	}
 
 	// var pageCount int32
-	var (
-		inBody  bool
-		inTitle bool
-		title   string
-		words   []string
-	)
 	for urlq := range queueChan {
+		var (
+			inBody  bool
+			inTitle bool
+			title   string
+			words   []string
+		)
 		reader := strings.NewReader(string(urlq.HTMLRaw))
 		tokenizer := html.NewTokenizer(reader)
 
@@ -361,8 +374,8 @@ func extractTextDataFromHTML(queueChan chan *CrawledURL, queue *Queue[CrawledURL
 					body := strings.Join(words, " ")
 					path := path(urlq.Url)
 					cc := CrawlContent{Title: title, Body: body, AddedAt: time.Now(), Path: path}
+					atomic.AddInt32(&crawlerStat.PageCount, 1)
 					ps.publish(CrawlContentTopic, cc)
-					fmt.Printf("EOF: %s\n", tokenErr.Error())
 					break
 				}
 				break
@@ -371,7 +384,6 @@ func extractTextDataFromHTML(queueChan chan *CrawledURL, queue *Queue[CrawledURL
 			switch tt {
 			case html.StartTagToken, html.SelfClosingTagToken:
 				token := tokenizer.Token()
-
 				if _, ok := skipTags[token.Data]; ok {
 					tt = tokenizer.Next()
 					continue
@@ -384,17 +396,16 @@ func extractTextDataFromHTML(queueChan chan *CrawledURL, queue *Queue[CrawledURL
 					inBody = true
 				}
 				if token.Data == "a" {
+					tokenizer.Next()
 					href := getHref(token)
-					if href == "" || contain(href) {
-						fmt.Println("skipping...", "url", href, queue.Size())
+					if href == "" {
 						continue
 					}
-					newUrl := CrawledURL{
-						Url: href,
+					if !visited(href) {
+						newUrl := CrawledURL{Url: href}
+						queue.enqueue(newUrl)
+						continue
 					}
-					fmt.Println(newUrl)
-					queue.enqueue(newUrl)
-					fmt.Printf("[%s] link added to queue queue size is %d\n", href, queue.Size())
 				}
 
 			case html.EndTagToken:
@@ -412,12 +423,10 @@ func extractTextDataFromHTML(queueChan chan *CrawledURL, queue *Queue[CrawledURL
 				if inTitle && title == "" {
 					title = strings.TrimSpace(tokenizer.Token().Data)
 				}
-
 				if inBody && len(words) < 1000 {
 					text := strings.TrimSpace(tokenizer.Token().Data)
 					tokens := tokenize(text)
 					remaining := 1000 - len(tokens)
-
 					if len(tokens) > remaining {
 						words = append(words, tokens[:remaining]...)
 					} else {
@@ -446,7 +455,7 @@ func getHref(tt html.Token) string {
 		if attr.Key != "href" {
 			continue
 		}
-		if restriceted, err := restrictDomain(attr.Val); err == nil && restriceted {
+		if isSameDomain(SeedUrl, attr.Val) {
 			return attr.Val
 		}
 	}
@@ -461,7 +470,8 @@ func isSameDomain(base, link string) bool {
 		return false
 	}
 
-	return baseURL.Hostname() == linkURL.Hostname()
+	host := strings.TrimPrefix(linkURL.Hostname(), "www.")
+	return baseURL.Hostname() == host
 }
 
 func checkRobotstxt(uri string) (string, error) {
@@ -511,16 +521,24 @@ func sendreq(url string) (*http.Response, error) {
 	return resp, err
 }
 
-func restrictDomain(ur string) (bool, error) {
-	u, err := url.Parse(ur)
-	if err != nil {
-		return false, err
-	}
-
-	su, err := url.Parse(SeedUrl)
-	if err != nil {
-		return false, err
-	}
-
-	return u.Host == su.Host, nil
+func (cs *Crawler) printCrawler(t time.Time, queueTotal int) {
+	fmt.Printf("total queued %d\n", queueTotal)
+	fmt.Printf("total crawl sized: %d\n", cs.TotalCrawlSize)
+	fmt.Printf("total number of page crawled: %d\n", cs.PageCount)
+	fmt.Printf("total crawld time in min: %.2f\n", t.Sub(cs.startTime).Minutes())
+	fmt.Printf("number of page skipped due to robots.txt: %d\n", cs.SkippedPagesRobots)
 }
+
+// func crawlerStats[T CrawlContent | CrawledURL | Crawler](t time.Time, cs *Crawler, queue *Queue[T]) {
+// 	elapsedMin := t.Sub(cs.startTime).Minutes()
+
+// 	if elapsedMin < 0.1 || cs.Size() == 0 {
+// 		fmt.Println("Crawling just started, not enough data to compute stats.")
+// 		return
+// 	}
+
+// 	if elapsedMin > 1 {
+// 		fmt.Printf("crawled page per minutes %.2f: queue size %d\n", elapsedMin, queue.Size())
+// 		fmt.Printf("page per minute: %.2f\n", float64(cs.Size())/elapsedMin)
+// 	}
+// }

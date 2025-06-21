@@ -18,17 +18,23 @@ func newPubsub[T any]() *PubSub[T] {
 		wg:          new(sync.WaitGroup),
 	}
 }
+
 func (p *PubSub[T]) publish(topic string, message T) {
 	p.pubLock.RLock()
+	defer p.pubLock.RUnlock()
 
 	if p.closed {
-		fmt.Println("closing!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+		fmt.Println("tried to publish to closed pubsub")
 		return
 	}
-	p.pubLock.RUnlock()
+
 	if chans, ok := p.subscribers[topic]; ok {
 		for _, ch := range chans {
-			ch <- message
+			select {
+			case ch <- message:
+			default:
+				fmt.Println("warning: could not send message, channel full or closed")
+			}
 		}
 	}
 }
@@ -51,7 +57,6 @@ func (ps *PubSub[T]) Unsubscribe(topic string, target <-chan T) {
 		if ch == target {
 			close(ch)
 			ps.subscribers[topic] = append(chans[:i], chans[i+1:]...)
-			ps.wg.Done()
 			break
 		}
 	}
@@ -59,13 +64,17 @@ func (ps *PubSub[T]) Unsubscribe(topic string, target <-chan T) {
 
 func (ps *PubSub[T]) Shutdown() {
 	ps.pubLock.Lock()
+	defer ps.pubLock.Unlock()
+
+	if ps.closed {
+		return
+	}
+
 	ps.closed = true
 	for _, subs := range ps.subscribers {
 		for _, ch := range subs {
 			close(ch)
 		}
 	}
-	ps.pubLock.Unlock()
-
-	ps.wg.Wait()
+	ps.subscribers = make(map[string][]chan T)
 }
