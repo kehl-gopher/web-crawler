@@ -50,13 +50,9 @@ After parsing a page, I store the results in MongoDB in a structured format like
 
 ```json
 {
-  "url": "https://example.com",
   "title": "Example Title",
   "description": "This is an example description.",
-  "links": [
-    "https://example.com/about",
-    "https://example.com/contact"
-  ]
+  "added_at": "2020-01-01:T00:00:00"
 }
 ```
 
@@ -95,7 +91,6 @@ This makes it easy for me to query or analyze the data later.
 
 * `robots.txt` support
 * Rate limiting to avoid spamming sites
-* Domain restriction (stay within the same host)
 * Custom depth limit
 * Export results as CSV or JSON
 
