@@ -1,6 +1,6 @@
 # 🕷️ Go Web Crawler
 
-This is a simple web crawler I built using **Go**, an HTML tokenizer, and **MongoDB** for data storage. It uses a **Breadth-First Search (BFS)** strategy to crawl pages, extracts useful information, and stores it in a structured format.
+This is a  web crawler I built using **Go**, an HTML tokenizer, and **MongoDB** for data storage. It uses a **Breadth-First Search (BFS)** strategy to crawl pages, extracts useful information, and stores it in a structured format.
 
 ---
 
