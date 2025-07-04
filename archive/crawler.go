@@ -233,6 +233,13 @@ func main() {
 
 	content := ps.subscribe(CrawlContentTopic, 100)
 
+	// tick := time.NewTicker(1 * time.Second)
+
+	// go func() {
+	// 	for t := range tick.C {
+	// 		crawlerStats(t, cs, crawlerQueue)
+	// 	}
+	// }()
 
 	wg.Add(3)
 	go func(content <-chan any) {
