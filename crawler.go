@@ -40,6 +40,7 @@ type Queue struct {
 	url       []string
 	size      int
 	totalSize int
+	queued    sync.Map
 }
 
 type Crawler struct {
@@ -49,16 +50,30 @@ type Crawler struct {
 	crawlerSize        int32
 }
 
+type CrawlContent struct {
+	Title   string    `bson:"title"`
+	Body    string    `bson:"body"`
+	Path    string    `bson:"path"`
+	AddedAt time.Time `bson:"added_at"`
+}
+
 func newQueue() *Queue {
 	url := make([]string, 0)
 	return &Queue{
 		url:       url,
 		queueLock: new(sync.Mutex),
+		queued:    sync.Map{},
 	}
 }
 
 // add to queue
 func (q *Queue) enqueue(data string) {
+	normalizedURL := strings.TrimSuffix(data, "/")
+	hashed := hashurl(normalizedURL)
+	if _, exists := q.queued.LoadOrStore(hashed, true); exists {
+		return
+	}
+
 	q.queueLock.Lock()
 	q.url = append(q.url, data)
 	q.size++
@@ -162,6 +177,18 @@ func ConnectDB(connStr string) *mongo.Client {
 	return client
 }
 
+func (cs *Crawler) tryMarkVisited(url string) bool {
+	normalizedURL := strings.TrimSuffix(url, "/")
+	hashedURL := hashurl(normalizedURL)
+
+	_, alreadyExists := urlVisited.LoadOrStore(hashedURL, true)
+	if !alreadyExists {
+		atomic.AddInt32(&cs.crawlerSize, 1)
+		return true
+	}
+	return false
+}
+
 // create mongo collection
 func AddToCollections(ctx context.Context, client *mongo.Client, collName string, docs interface{}) error {
 	col := client.Database(DBName).Collection(collName)
@@ -171,6 +198,7 @@ func AddToCollections(ctx context.Context, client *mongo.Client, collName string
 		fmt.Println("failed to insert data in mongo: " + err.Error())
 		return err
 	}
+	fmt.Println("Data added to database")
 	return nil
 }
 
@@ -278,7 +306,7 @@ func main() {
 	if err := godotenv.Load(".env"); err != nil {
 		fmt.Println("no environment file set skipping...")
 	} else {
-		dbCred = os.Getenv("DBcred")
+		dbCred = os.Getenv("DBCred")
 	}
 
 	if dbCred != "" {
@@ -290,7 +318,7 @@ func main() {
 	cs := &Crawler{startTime: time.Now(), pageCount: 0, crawlerSize: 0, skippedPagesRobots: 0}
 	que := newQueue()
 	que.enqueue(SeedUrl)
-	cs.markvisted(SeedUrl)
+	cs.tryMarkVisited(SeedUrl)
 
 	go sendRequest(que.dequeue(), contentByte)
 
@@ -364,7 +392,7 @@ func main() {
 	fmt.Println("queue size after crawl", que.qsize()) //for debugging
 	fmt.Printf("Pages Crawled: %d\n", cs.pageCount)
 	fmt.Printf("Crawl Minute per Page: %.4fs\n", duration/float64(cs.pageCount))
-	fmt.Printf("Crawl Success Ratio: %.2f\n", float64(cs.pageCount)/float64(cs.crawlerSize))
+	fmt.Printf("Crawl Success Ratio: %.2f\n", float64(cs.pageCount)/float64(cs.size()))
 	fmt.Printf("queue size %d\n", que.qtotalSize())
 	fmt.Printf("crawl size %d\n", cs.crawlerSize)
 	fmt.Printf("skipped page robots.txt: %d\n", cs.skippedPagesRobots)
@@ -417,12 +445,13 @@ func extractContent(que *Queue, contentByte []byte, cs *Crawler, mg *mongo.Clien
 		"img":        true,
 	}
 
-	parseHTML(que, contentByte, cs, skipTags)
+	parseHTML(que, contentByte, cs, skipTags, mg)
 }
 
-func parseHTML(que *Queue, content []byte, cs *Crawler, skipTags map[string]bool) {
+func parseHTML(que *Queue, content []byte, cs *Crawler, skipTags map[string]bool, mg *mongo.Client) {
 	contentReader := strings.NewReader(string(content))
 	tokenizer := html.NewTokenizer(contentReader)
+	// done := make(chan struct{})
 	for {
 		var (
 			inBody  bool
@@ -435,6 +464,11 @@ func parseHTML(que *Queue, content []byte, cs *Crawler, skipTags map[string]bool
 			tokenErr := tokenizer.Err()
 			if tokenErr == io.EOF {
 				atomic.AddInt32(&cs.pageCount, 1)
+				body := strings.Join(words, " ")
+				cc := CrawlContent{Title: title, Body: body, AddedAt: time.Now()}
+				if DBconnected {
+					AddToCollections(context.TODO(), mg, CollectionContent, cc)
+				}
 				break
 			}
 
@@ -456,9 +490,9 @@ func parseHTML(que *Queue, content []byte, cs *Crawler, skipTags map[string]bool
 			if token.Data == "a" {
 				tokenizer.Next()
 				href := strings.TrimSpace(getHref(token))
-				if !cs.visited(href) && href != "" {
+				if cs.tryMarkVisited(href) && href != "" {
 					fmt.Printf("added %s to queue: queue size is %d\n", href, que.qsize())
-					cs.markvisted(href)
+					cs.tryMarkVisited(href)
 					que.enqueue(href)
 				}
 			}
